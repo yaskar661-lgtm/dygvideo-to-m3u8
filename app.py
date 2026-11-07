@@ -99,6 +99,38 @@ def get_channel_stream(channel_name):
             else:
                 processed_content += line + "\n"
 
+        # Kral Pop için özel URL düzenlemesi
+        if channel_name == "kralpoptv":
+            st_match = re.search(r'[?&]st=([^&]+)', target_url)
+            e_match = re.search(r'[?&]e=([^&]+)', target_url)
+            
+            if st_match and e_match:
+                st_val = st_match.group(1)
+                e_val = e_match.group(1)
+                target_url = f"https://dogusdyg-kralpoptv.lg.mncdn.com/dogusdyg-kralpoptv/dogusdyg_kralpoptv.smil/playlist.m3u8?st={st_val}&e={e_val}"
+
+        # CDN base URL'ini Location adresinden türet 
+        cdn_base = target_url.rsplit('/', 1)[0] + '/'
+
+        # 4. Asıl m3u8 içeriğini çek
+        content_response = requests.get(target_url, headers=headers, timeout=10)
+        if content_response.status_code != 200:
+            content_response = requests.get(live_url, headers=headers, timeout=10)
+            
+        if content_response.status_code != 200:
+            return "Yayın içeriği alınamadı.", 500
+
+        raw_content = content_response.text
+        lines = raw_content.split("\n")
+
+        # 5. live_ ile başlayan satırlara CDN base ekle
+        processed_content = ""
+        for line in lines:
+            if line.startswith("live_") or line.startswith("stream") or line.startswith("chunklist"):
+                processed_content += cdn_base + line + "\n"
+            else:
+                processed_content += line + "\n"
+                
         # 6. re.subn ile metin içindeki 'eurostar' yazılarını istenen kanal slug'ına çevir
         if channel_name != "eurostar":
             final_content, count = re.subn(r'eurostar', channel_name, processed_content, flags=re.IGNORECASE)
