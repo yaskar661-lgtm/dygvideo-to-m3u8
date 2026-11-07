@@ -7,7 +7,7 @@ from threading import Lock
 app = Flask(__name__)
 
 # Desteklenen geçerli kanal listesi
-VALID_CHANNELS = ["eurostar", "star", "ntv", "kralpop"]
+VALID_CHANNELS = ["eurostar", "star", "ntv", "kralpoptv"]
 
 # 2 saatlik (7200 saniye) TTL Cache sınıfı
 class TTLCache:
