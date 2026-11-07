@@ -1,87 +1,117 @@
-import re
+from flask import Flask, Response, abort
 import requests
-from flask import Flask, redirect
+import re
+import time
+from threading import Lock
 
 app = Flask(__name__)
 
-# Önbellek (Cache)
-stream_urls = {}
+# Desteklenen geçerli kanal listesi
+VALID_CHANNELS = ["eurostar", "star", "ntv", "kralpop"]
 
-DIRECT_STREAMS = {
-    "startv": "http://dygvideo.dygdigital.com/live/hls/startv4puhu?m3u8",
-    "ntv": "http://dygvideo.dygdigital.com/live/hls/ntv4puhu?m3u8",
-    "kralpoptv": "http://dygvideo.dygdigital.com/live/hls/kralpop?m3u8"
-}
+# 2 saatlik (7200 saniye) TTL Cache sınıfı
+class TTLCache:
+    def __init__(self, ttl=7200):
+        self.ttl = ttl
+        self.cache_store = {}
+        self.lock = Lock()
 
-def update_channels():
-    """Her 2 saatte bir arka planda yayın linklerini günceller."""
-    print("🔄 Doğuş kanalları güncelleniyor...")
-    global stream_urls
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+    def get(self, key):
+        with self.lock:
+            if key in self.cache_store:
+                data, timestamp = self.cache_store[key]
+                if time.time() - timestamp < self.ttl:
+                    return data
+            return None
 
-    # 1. Star TV, NTV, Kral Pop ve diğer direkt/yönlendirmeli linkler
-    for name, url in DIRECT_STREAMS.items():
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                stream_urls[name] = url
-                print(f"✅ {name}: Bağlantı doğrulandı.")
-        except Exception as e:
-            print(f"❌ {name} güncellenirken hata: {e}")
+    def set(self, key, data):
+        with self.lock:
+            self.cache_store[key] = (data, time.time())
+            return data
 
-    # 2. Euro Star (Star TV linkinin Location header'ını alıp 'star' -> 'eurostar' değişimi)
-    try:
-        # allow_redirects=False diyerek 302 yönlendirmesini yakalıyoruz
-        res = requests.get(DIRECT_STREAMS["startv"], headers=headers, allow_redirects=False, timeout=10)
-        
-        # Eğer yönlendirme (302 vb.) geldiyse ve Location başlığı varsa
-        if res.status_code in (301, 302, 303, 307, 308) and "Location" in res.headers:
-            star_location = res.headers["Location"]
-            # re.sub ile 'star' kelimesini 'eurostar' olarak değiştiriyoruz
-            eurostar_url = re.sub(r'star', 'eurostar', star_location, flags=re.IGNORECASE)
-            stream_urls["eurostartv"] = eurostar_url
-            print(f"✅ eurostartv: Location header'dan türetildi.")
-        else:
-            # Yönlendirme yoksa doğrudan Star TV linkini baz alıp değiştirmeyi dene
-            fallback_url = re.sub(r'star', 'eurostar', DIRECT_STREAMS["startv"], flags=re.IGNORECASE)
-            stream_urls["eurostartv"] = fallback_url
-            print(f"⚠️ eurostartv: Alternatif yöntemle türetildi.")
-            
-    except Exception as e:
-        print(f"❌ eurostartv türetilirken hata: {e}")
+playlist_cache = TTLCache(ttl=7200)
 
-@app.route("/")
-def index():
-    """Ana sayfa - Mevcut kanal listesini gösterir."""
-    return {
-        "channels": list(stream_urls.keys()),
-        "endpoints": {
-            "redirect": "/stream/<channel_name>"
-        }
-    }
-
-@app.route("/stream/<channel_name>")
-def redirect_stream(channel_name):
-    """Kanalların güncel yayın adresine yönlendirir (redirect)."""
+@app.route("/canli/<channel_name>.m3u8", methods=["GET"])
+def get_channel_stream(channel_name):
     channel_name = channel_name.lower()
-    if channel_name in stream_urls:
-        return redirect(stream_urls[channel_name])
-    return {"error": "Kanal bulunamadı."}, 404
+    if channel_name not in VALID_CHANNELS:
+        abort(404, description="Geçersiz kanal adı.")
+
+    # 1. Cache kontrolü
+    cached_data = playlist_cache.get(channel_name)
+    if cached_data:
+        return Response(cached_data, mimetype="application/vnd.apple.mpegurl")
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    try:
+        # 2. Eurostar ana sayfasından liveUrl'i çek
+        source_page = "https://www.eurostartv.com.tr/canli-izle"
+        main_response = requests.get(source_page, headers=headers, timeout=10)
+        
+        if main_response.status_code != 200:
+            return "Kaynak sayfa yüklenemedi.", 500
+
+        match = re.search(r"liveUrl = '(.*?)'", main_response.text)
+        if not match:
+            return "Live URL bulunamadı.", 404
+
+        live_url = match.group(1)
+
+        # 3. liveUrl isteği atıp 302 yönlendirmesini ve Location header'ını yakala
+        redirect_response = requests.get(live_url, headers=headers, allow_redirects=False, timeout=10)
+        
+        if redirect_response.status_code == 302 and "Location" in redirect_response.headers:
+            target_url = redirect_response.headers["Location"]
+        else:
+            target_url = live_url
+
+        # NTV için özel URL düzenlemesi
+        if channel_name == "ntv":
+            st_match = re.search(r'[?&]st=([^&]+)', target_url)
+            e_match = re.search(r'[?&]e=([^&]+)', target_url)
+            
+            if st_match and e_match:
+                st_val = st_match.group(1)
+                e_val = e_match.group(1)
+                target_url = f"https://dogusdyg-ntv.lg.mncdn.com/live/dogusdyg_ntv/master.m3u8?st={st_val}&e={e_val}"
+
+        # CDN base URL'ini Location adresinden türet 
+        # (NTV için: https://dogusdyg-ntv.lg.mncdn.com/live/dogusdyg_ntv/)
+        cdn_base = target_url.rsplit('/', 1)[0] + '/'
+
+        # 4. Asıl m3u8 içeriğini çek
+        content_response = requests.get(target_url, headers=headers, timeout=10)
+        if content_response.status_code != 200:
+            content_response = requests.get(live_url, headers=headers, timeout=10)
+            
+        if content_response.status_code != 200:
+            return "Yayın içeriği alınamadı.", 500
+
+        raw_content = content_response.text
+        lines = raw_content.split("\n")
+
+        # 5. live_ ile başlayan satırlara CDN base ekle
+        processed_content = ""
+        for line in lines:
+            if line.startswith("live_") or line.startswith("stream"):
+                processed_content += cdn_base + line + "\n"
+            else:
+                processed_content += line + "\n"
+
+        # 6. re.subn ile metin içindeki 'eurostar' yazılarını istenen kanal slug'ına çevir
+        if channel_name != "eurostar":
+            final_content, count = re.subn(r'eurostar', channel_name, processed_content, flags=re.IGNORECASE)
+        else:
+            final_content = processed_content
+
+        # 7. Sonucu cache'e kaydet (2 saat)
+        playlist_cache.set(channel_name, final_content)
+
+        return Response(final_content, mimetype="application/vnd.apple.mpegurl")
+
+    except Exception as e:
+        return f"Bir hata oluştu: {str(e)}", 500
 
 if __name__ == "__main__":
-    # İlk çalıştırmada hemen verileri çek
-    update_channels()
-
-    # APScheduler ile her 2 saatte bir tetiklenecek şekilde ayarla
-    from apscheduler.schedulers.background import BackgroundScheduler
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=update_channels, trigger="interval", hours=2)
-    scheduler.start()
-
-    try:
-        app.run(host="0.0.0.0", port=5000, debug=False)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    app.run(host="0.0.0.0", port=5000, debug=True)
